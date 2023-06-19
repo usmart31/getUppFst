@@ -1,0 +1,226 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+
+
+```{r}
+library(devtools)
+install_github('Ahhgust/Haplotypical')
+install_github('Ahhgust/MMDIT')
+install.packages("remotes")
+remotes::install_github("thierrygosselin/assigner")
+suppressPackageStartupMessages(library(tidyverse))
+suppressPackageStartupMessages(library(Haplotypical))
+suppressPackageStartupMessages(library(MMDIT))
+#suppressPackageStartupMessages(library(hierfstat))
+suppressPackageStartupMessages(library(pegas))
+suppressPackageStartupMessages(library(assigner))
+
+```
+
+
+```{r}
+db <- loadMMDIT( system.file("extdata", package="MMDIT") )
+xy<-MMDIT::getSeqdiffs (db, pop=c("AS", "AM"), ignoreIndels=TRUE, getPopulation=TRUE)
+#MMDIT::getSeqdiffs (db, pop="%", ignoreIndels=TRUE, getPopulation=FALSE)
+#MMDIT::getSeqdiffs (db, pop="AS", ignoreIndels=TRUE, getPopulation=FALSE)
+MMDIT::getPops(db)
+
+
+a<-filter(xy, pop=="AM")
+b<-filter(xy, pop=="AS")
+A<-head(a, 1000)
+B<-head(b, 1000)
+y<-bind_rows(A,B)
+#y%>%group_by(sampleid)%>%slice(1:2)->y1
+
+sample<-y$sampleid
+pos<-y$position
+nuc<-y$basecall
+pop<-y$pop
+
+sample<-xy$sampleid
+pos<-xy$position
+nuc<-xy$basecall
+pop<-xy$pop
+
+```
+
+
+```{r}
+Tib2<-tibble(MARKERS = c("Mito", "Mito", "Mito", "Mito", "Mito", "Mito"), 
+            INDIVIDUALS = c("T1", "T2", "T3", "T4", "T5", "T6"), 
+            POP_ID = c("AF", "AF", "AF", "AS", "AS", "AS"), 
+            GT = c("3/54", "3/54", "3/54","4/4", "4/4", "4/4"
+                   ))
+
+tib<-tibble(MARKERS = c("Mito", "Mito", "Mito", "Mito", "Mito", "Mito"), 
+            INDIVIDUALS = c("T1", "T2", "T3", "T4", "T5", "T6"), 
+            population = as.factor(c("AF", "AF", "AF", "AS", "AS", "AS")), 
+            GT = as.factor(c("3/54", "3/54", "3/54","4/4", "4/4", "4/4"
+            )))
+tib2<-as.data.frame(tib)
+```
+
+```{r}
+ getBs<-function(tib) {
+      x1<-unique(tib$sampleid) #get a vector of all unique sample IDs
+      n<-length(x1) #store the number of unique individuals in a variable 
+      nboot = 1 # set the number of boots
+      #set.seed(1049)
+      # Generate 1 bootstrap samples, i.e. an n x 1 array of 
+      tmpdata<-sample(x1,n*nboot, replace=TRUE) # random resamples from the vector of sample IDs
+      bootstrapsample<-matrix(tmpdata, nrow=n, ncol=nboot) # convert the resampled data into a matrix with col and row names 
+      bs<-as.data.frame(bootstrapsample)%>%dplyr::rename(sampleid=V1)%>%tibble::rowid_to_column("rowid") # convert the matrix into a dataframe
+      x2<-dplyr::left_join(bs, tib) # join this dataframe to the whole data to provide haplotype information 
+      #associated with each resampled individual
+      return(x2) # return the joined table
+    }
+```
+
+
+
+```{r}
+getFst<-function(x2){
+#tib<-dplyr::tibble(sampleid=sample, position=pos, basecall=nuc, population=pop) # make tibble from input vectors
+  tidyr::spread(x2, position, basecall)->D1
+  D2<-tidyr::unite(D1, h, -population, -sampleid, sep = "", remove = TRUE) # create a column that represents all columns pated together
+  D2$h<-as.factor(D2$h) # convert the new column into type factor
+  D3<-dplyr::mutate(D2, h1 = as.numeric(h))%>%select(-h) # make a new column that contains the numerized factors 
+  # D4<-mutate(D3, h2 = case_when(
+  #   nchar(h1) == 1 ~ paste("00", h1, sep = ""),
+  #   nchar(h1) == 2 ~ paste(0, h1, sep = ""),
+  #   TRUE ~ as.character(h1)
+  # ))
+  D4<-tibble::rowid_to_column(D3, "index") # create a new column from row index (to help with merging of consecutive rows )
+  #group by the populations column; add a new column for each population that merges the haplotypes of every odd rows
+  #with the next row and adds a NA for every even row; then keep only rows that don't have NAs; ungroup data
+  D5<-D4%>% dplyr::group_by(population)%>%dplyr::mutate(h2=dplyr::if_else(index %% 2 != 0, paste(h1,lead(h1), sep = "/"), "NA"))%>% dplyr::filter(h2!="NA")%>%dplyr::ungroup()
+  D5$h2<-as.factor(D5$h2) # convert the new column from string to factor
+  D6<- D5[!stringr::str_detect(D5$h2, "NA"),]%>%dplyr::select(population, h2)# remove rows with NAs (i.e. rows that have not been merged)
+  D7<-as.data.frame(D6)
+  D8<-rowid_to_column(D7)%>%rename(INDIVIDUALS=rowid, POP_ID=population, GT=h2)%>% mutate(MARKERS = "Mito")%>% select(MARKERS, everything())
+  #D9<-radiator::tidy_wide(D8)
+  D9.gen<-as_tibble(D8)
+  Fstat<-fst_WC84(D9, filename = "Test")
+  Fstat[[2]]$FST # return the Fst value
+}
+  
+  
+  
+```
+
+
+The full function 
+```{r}
+getUppFst<-function(sample, pos, nuc, pop, nBS=100, qt=0.95) {
+  tib<-dplyr::tibble(sampleid=sample, position=pos, basecall=nuc, population=pop) # make tibble from input vectors
+  
+  # if (!(is.character(tib$sampleid))){ # if the column sampleid does not contain string data
+  #   stop("Sampleid vector needs to be of the type 'charachter'") # give an error message to user
+  # } 
+  # if (!(is.numeric(tib$position))){ # if the column position does not contain numeric data
+  #   stop("Position vector needs to be of the type 'numeric'") # give an error message to user
+  # } 
+  # # v1<-if_else(tib$basecall=="A"|tib$Allele=="T"|tib$Allele=="G"|tib$Allele=="C"|tib$Allele=="", 0, 1) # if the column Allele contains ACTorG record a 0, otherwise a 1
+  # # if (sum(tibble(v1))!=0) { # if the sum of the above vector is not 0 
+  # #   stop("Allele vector needs to be either A or T or G or C (case sensitive) or an empty string") # give an error message to user
+  # # } 
+  # if (!(is.character(tib$population))){ # if the column population does not contain string data
+  #   stop("Population vector needs to be of the type 'charachter'") # give an error message to user
+  # } 
+  # if (!(is.numeric(nBS))){ # if nBS is not  numeric 
+  #   stop("Number of bootstraps needs to be of the type 'numeric'") # give an error message to user
+  # } 
+  # if (!(is.numeric(qt))){ # if qt is not  numeric 
+  #   stop("Qu needs to be of the type 'numeric'") # give an error message to user
+  # } 
+  # wrapper function for boostrapping individuals within the population and then calculating Fst
+  getBsFst<-function(tib){
+    getBs<-function(tib) {
+      x1<-unique(tib$sampleid) #get a vector of all unique sample IDs
+      n<-length(x1) #store the number of unique individuals in a variable 
+      nboot = 1 # set the number of boots
+      #set.seed(1049)
+      # Generate 1 bootstrap samples, i.e. an n x 1 array of 
+      tmpdata<-sample(x1,n*nboot, replace=TRUE) # random resamples from the vector of sample IDs
+      bootstrapsample<-matrix(tmpdata, nrow=n, ncol=nboot) # convert the resampled data into a matrix with col and row names 
+      bs<-as.data.frame(bootstrapsample)%>%dplyr::rename(sampleid=V1)%>%tibble::rowid_to_column("rowid") # convert the matrix into a dataframe
+      x2<-dplyr::left_join(bs, tib) # join this dataframe to the whole data to provide haplotype information 
+      #associated with each resampled individual
+      return(x2) # return the joined table
+}
+    getFst<-function(x2){
+      #tib<-dplyr::tibble(sampleid=sample, position=pos, basecall=nuc, population=pop) # make tibble from input vectors
+
+      tidyr::spread(x2, position, basecall)->D1
+      D2<-tidyr::unite(D1, h, -population, -sampleid, sep = "", remove = TRUE) # create a column that represents all columns pated together
+      D2$h<-as.factor(D2$h) # convert the new column into type factor
+      D3<-dplyr::mutate(D2, h1 = as.numeric(h))%>%select(-h) # make a new column that contains the numerized factors 
+      D4<-tibble::rowid_to_column(D3, "index") # create a new column from row index (to help with merging of consecutive rows )
+      #group by the populations column; add a new column for each population that merges the haplotypes of every odd rows
+      #with the next row and adds a NA for every even row; then keep only rows that don't have NAs; ungroup data
+      D5<-D4%>% dplyr::group_by(population)%>%dplyr::mutate(h2=dplyr::if_else(index %% 2 != 0, paste(h1,lead(h1), sep = "/"), "NA"))%>% dplyr::filter(h2!="NA")%>%dplyr::ungroup()
+      D5$h2<-as.factor(D5$h2) # convert the new column from string to factor
+      D6<- D5[!stringr::str_detect(D5$h2, "NA"),]%>%dplyr::select(population, h2)# remove rows with NAs (i.e. rows that have not been merged)
+      D7<-as.data.frame(D6)
+      D8<-rowid_to_column(D7)%>%rename(INDIVIDUALS=rowid, POP_ID=population, GT=h2)%>% mutate(MARKERS = "Mito")%>% select(MARKERS, everything())
+  #D9<-radiator::tidy_wide(D8)
+      D9<-as_tibble(D8)
+      Fstat<-fst_WC84(D9, filename = "Test")
+      return(Fstat[[2]]$FST) # return the Fst value
+}
+
+tib%>%dplyr::group_by(population)%>%
+    dplyr::group_modify(~ getBs(.x) ) -> df1 # apply bootstrap function by group
+  #df2<-dplyr::bind_rows(df1[1], df1[2]) # group-map retunrs a list object, convert it to a dataframe
+  f<-getFst(df1)  # apply getFst on the resampled dataset
+  } 
+  
+Fstdist<-replicate(nBS, getBsFst(tib)) # repeat the the bootstrapped Fst function nBS number of times
+d<-stats::quantile(Fstdist, qt) # Calculate the q% quantile for the mean
+cat("Upper Bound of Fst : ", d, "\n") # return the result
+
+}
+
+```
+
+
+
+
+
+```{r}
+#to run fst_WC84 with example dataset
+Fstat<-fst_WC84(Tib2, pairwise = FALSE, filename = "Test", ci = TRUE, iteration.ci = 1000)
+  return(f[2]) # return the Fst value
+```
+
+
+```{r}
+#for Pegas
+tib<-dplyr::tibble(sampleid=sample, position=pos, basecall=nuc, population=pop) # make tibble from input vectors
+  tidyr::spread(tib, position, basecall)->d1
+  d2<-tidyr::unite(d1, h, -population, -sampleid, sep = "", remove = TRUE) # create a column that represents all columns pated together
+  d2$h<-as.factor(d2$h) # convert the new column into type factor
+  d3<-dplyr::mutate(d2, h1 = as.numeric(h))%>%select(-h) # make a new column that contains the numerized factors 
+d4<-tibble::rowid_to_column(d3, "index") # create a new column from row index (to help with merging of consecutive rows )
+  #group by the populations column; add a new column for each population that merges the haplotypes of every odd rows
+  #with the next row and adds a NA for every even row; then keep only rows that don't have NAs; ungroup data
+  d5<-d4%>% dplyr::group_by(population)%>%dplyr::mutate(h2=dplyr::if_else(index %% 2 != 0, paste(h1,lead(h1), sep = "/"), "NA"))%>% dplyr::filter(h2!="NA")%>%dplyr::ungroup()
+  d5$h2<-as.factor(d5$h2) # convert the new column from string to factor
+  d6<- d5[!stringr::str_detect(d5$h2, "NA"),]%>%dplyr::select(population, h2)# remove rows with NAs (i.e. rows that have not been merged)
+  d7<-as.data.frame(d6)
+d8<-pegas::as.loci(d7, col.pop = 1) # convert the df to an object of class loci (see package pegas
+      f<-pegas::Fst(d8) # calculate Fst
+      return(f[2]) # return the Fst value
+      
+      
+d8<-pegas::as.loci(tib2, col.pop = 3, col.loci = "GT") # convert the df to an object of class loci (see package pegas
+      f<-pegas::Fst(d8) # calculate Fst
+      return(f[2]) # return the Fst value     
+
+```
+
